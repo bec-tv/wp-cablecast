@@ -45,6 +45,9 @@ function cablecast_install() {
 
     // clear the permalinks after the post type has been registered
     flush_rewrite_rules();
+
+    // Uncomment for debugging
+    cablecast_sync_data();
 }
 register_activation_hook( __FILE__, 'cablecast_install' );
 

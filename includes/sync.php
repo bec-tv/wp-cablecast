@@ -3,11 +3,12 @@
 function cablecast_sync_data() {
   $options = get_option('cablecast_options');
   $server = $options["server"];
-  cablecast_log ("Syncing data for $server");
+  $location = $options['location'];
+  cablecast_log ("Syncing data for $server at location $location");
 
   $channels = cablecast_get_resources("$server/cablecastapi/v1/channels", 'channels');
   $live_streams = cablecast_get_resources("$server/cablecastapi/v1/livestreams", 'liveStreams');
-  $categories = cablecast_get_resources("$server/cablecastapi/v1/categories", 'categories');
+  $categories = cablecast_get_resources("$server/cablecastapi/v1/categories?location=$location", 'categories');
   $producers = cablecast_get_resources("$server/cablecastapi/v1/producers", 'producers');
   $projects = cablecast_get_resources("$server/cablecastapi/v1/projects", 'projects');
   $show_fields = cablecast_get_resources("$server/cablecastapi/v1/showfields", 'showFields');
@@ -40,9 +41,10 @@ function cablecast_get_shows_payload() {
     $sync_index = 0;
   }
   $server = $options["server"];
+  $location = $options["location"];
   cablecast_log ("Getting shows since: $since" );
 
-  $json_search = "{\"savedShowSearch\":{\"query\":{\"groups\":[{\"orAnd\":\"and\",\"filters\":[{\"field\":\"lastModified\",\"operator\":\"greaterThan\",\"searchValue\":\"$since\"}]}],\"sortOptions\":[{\"field\":\"lastModified\",\"descending\":false},{\"field\":\"title\",\"descending\":false}]},\"name\":\"\"}}";
+  $json_search = "{\"savedShowSearch\":{\"query\":{\"groups\":[{\"orAnd\":\"and\",\"filters\":[{\"field\":\"lastModified\",\"operator\":\"greaterThan\",\"searchValue\":\"$since\"},{\"field\":\"location\",\"operator\":\"equals\",\"searchValue\":\"$location\"}]}],\"sortOptions\":[{\"field\":\"lastModified\",\"descending\":false},{\"field\":\"title\",\"descending\":false}]},\"name\":\"\"}}";
 
   $opts = array('http' =>
       array(
@@ -55,7 +57,6 @@ function cablecast_get_shows_payload() {
   $context = stream_context_create($opts);
   $result = file_get_contents("$server/cablecastapi/v1/shows/search/advanced", false, $context);
   $result = json_decode($result);
-
 
   $total_result_count = count($result->savedShowSearch->results);
   if ($total_result_count <= $sync_index) {
@@ -105,55 +106,139 @@ function cablecast_sync_shows($shows_payload, $categories, $projects, $producers
 
   foreach($shows_payload->shows as $show) {
     cablecast_log ("Syncing Show: ($show->id) $show->title");
-    $args = array(
-        'meta_key' => 'cablecast_show_id',
-        'meta_value' => $show->id,
-        'post_type' => 'show',
-        'post_status' => 'any',
-        'posts_per_page' => 1
-    );
 
-    $posts = get_posts($args);
-    if (count($posts)) {
-      $post = $posts[0];
-
-      $update_params = array(
-        'ID'            => $post->ID,
-        'post_title'    => isset($show->cgTitle) ? $show->cgTitle : $show->title,
-        'post_content'  => isset($show->comments) ? $show->comments : ''
-      );
-
-      wp_update_post($update_params);
-      
-    } else {
-      $post = array(
-          'post_title'    => isset($show->cgTitle) ? $show->cgTitle : $show->title,
-          'post_content'  => isset($show->comments) ? $show->comments : '',
-          'post_date'     => $show->eventDate,
-          'post_status'   => 'publish',
-          'post_type'     => 'show',
-          'meta_input'    => array(
-            'cablecast_show_id' => $show->id
-          )
-      );
-      $post = get_post(wp_insert_post( $post ));
+    $new = false;
+    $product = wc_get_product(wc_get_product_id_by_sku($show->id));
+    if (!$product) {
+      $new = true;
+      $product = new WC_Product_Variable();
     }
 
-    $lastModified = get_metadata('post', $post->ID, 'cablecast_last_modified', true);
-    if ($lastModified == $show->lastModified) {
-      //print "Skipping $show->id: It has not been modified\n";
-      //continue;
+    $product->set_name($show->cgTitle);
+    $product->set_slug($show->id);
+    $product->set_sku($show->id);
+    $product->set_date_created($show->eventDate);
+    $product->set_date_modified($show->lastModified);
+
+    if (empty($show->category) == FALSE) {
+      $category = cablecast_extract_id($show->category, $categories);
+      if ($category != NULL) {
+        $doc['category'] = $category->name;
+        $term = term_exists( "$category->id", 'product_cat');
+        $product->set_category_ids([$term['term_id']]);
+      }
     }
 
-    $id = $post->ID;
+    $product->save();
 
     if (isset($show->showThumbnailOriginal)) {
       $webFile = cablecast_extract_id($show->showThumbnailOriginal, $shows_payload->webFiles);
-      if ($webFile != NULL) {
-        $thumbnail_id = cablecast_insert_attachment_from_url($webFile, $id);
-        set_post_thumbnail( $id, $thumbnail_id );
-      }
+      $imageId = cablecast_insert_attachment_from_url($webFile, $product->get_id());
+      $product->set_image_id($imageId);
+      $product->save();
     }
+
+    $attributes = [];
+
+    // $dateAttribute = new WC_Product_Attribute();
+    // $dateAttribute->set_name("Event Date");
+    // $dateAttribute->set_visible(true);
+    // $dateAttribute->set_variation(false);
+    // $dateAttribute->set_options([date("F jS, Y", strtotime($show->eventDate))]);
+    // $attributes[] = $dateAttribute;
+
+    // $rtAttribute = new WC_Product_Attribute();
+    // $rtAttribute->set_name("Length");
+    // $rtAttribute->set_visible(true);
+    // $rtAttribute->set_variation(false);
+    // $rtAttribute->set_options([cablecast_get_human_readable_trt(cablecast_calculate_trt($show, $shows_payload->reels))]);
+    // $attributes[] = $rtAttribute;
+
+    $typeAttribute = new WC_Product_Attribute();
+    $typeAttribute->set_name("Type");
+    $typeAttribute->set_visible(false);
+    $typeAttribute->set_variation(true);
+    $typeAttribute->set_options(["DVD", "VHS", "Download"]);
+    $attributes[] = $typeAttribute;
+
+    $product->set_attributes($attributes);
+    $product->save();
+
+    if ($new) {
+      $dvd = new WC_Product_Variation();
+      $dvd->set_parent_id($product->get_id());
+      $dvd->set_attributes(["type" => "DVD"]);
+
+      $dvd->set_regular_price(25);
+
+      $dvd->save();
+
+      $vhs = new WC_Product_Variation();
+      $vhs->set_parent_id($product->get_id());
+      $vhs->set_attributes(["type" => "VHS"]);
+
+      $vhs->set_regular_price(35);
+
+      $vhs->save();
+
+      $product->set_children([$dvd->get_id(), $vhs->get_id()]);
+      $product->save();
+    }
+
+    $id = $product->get_id();
+
+    // $product = new WC_Product($show->id);
+
+
+    // $args = array(
+    //     'meta_key' => 'cablecast_show_id',
+    //     'meta_value' => $show->id,
+    //     'post_type' => 'show',
+    //     'post_status' => 'any',
+    //     'posts_per_page' => 1
+    // );
+
+    // $posts = get_posts($args);
+    // if (count($posts)) {
+    //   $post = $posts[0];
+
+    //   $update_params = array(
+    //     'ID'            => $post->ID,
+    //     'post_title'    => isset($show->cgTitle) ? $show->cgTitle : $show->title,
+    //     'post_content'  => isset($show->comments) ? $show->comments : ''
+    //   );
+
+    //   wp_update_post($update_params);
+
+    // } else {
+    //   $post = array(
+    //       'post_title'    => isset($show->cgTitle) ? $show->cgTitle : $show->title,
+    //       'post_content'  => isset($show->comments) ? $show->comments : '',
+    //       'post_date'     => $show->eventDate,
+    //       'post_status'   => 'publish',
+    //       'post_type'     => 'show',
+    //       'meta_input'    => array(
+    //         'cablecast_show_id' => $show->id
+    //       )
+    //   );
+    //   $post = get_post(wp_insert_post( $post ));
+    // }
+
+    // $lastModified = get_metadata('post', $post->ID, 'cablecast_last_modified', true);
+    // if ($lastModified == $show->lastModified) {
+    //   //print "Skipping $show->id: It has not been modified\n";
+    //   //continue;
+    // }
+
+    // $id = $post->ID;
+
+    // if (isset($show->showThumbnailOriginal)) {
+    //   $webFile = cablecast_extract_id($show->showThumbnailOriginal, $shows_payload->webFiles);
+    //   if ($webFile != NULL) {
+    //     $thumbnail_id = cablecast_insert_attachment_from_url($webFile, $id);
+    //     set_post_thumbnail( $id, $thumbnail_id );
+    //   }
+    // }
 
     if (isset($show->vods) && count($show->vods)) {
       $vod = cablecast_extract_id($show->vods[0], $shows_payload->vods);
@@ -163,55 +248,55 @@ function cablecast_sync_shows($shows_payload, $categories, $projects, $producers
       }
     }
 
-    if (empty($show->producer) == FALSE) {
-      $producer = cablecast_extract_id($show->producer, $producers);
-      if ($producer != NULL) {
-        cablecast_upsert_post_meta($id, "cablecast_producer_name", $producer->name);
-        cablecast_upsert_post_meta($id, "cablecast_producer_id", $producer->id);
-        $processed_producer = cablecast_replace_commas_in_tag($producer->name);
-        wp_set_post_terms( $id, $processed_producer, 'cablecast_producer');
-      }
-    }
+    // if (empty($show->producer) == FALSE) {
+    //   $producer = cablecast_extract_id($show->producer, $producers);
+    //   if ($producer != NULL) {
+    //     cablecast_upsert_post_meta($id, "cablecast_producer_name", $producer->name);
+    //     cablecast_upsert_post_meta($id, "cablecast_producer_id", $producer->id);
+    //     $processed_producer = cablecast_replace_commas_in_tag($producer->name);
+    //     wp_set_post_terms( $id, $processed_producer, 'cablecast_producer');
+    //   }
+    // }
 
-    if (empty($show->project) == FALSE) {
-      $project = cablecast_extract_id($show->project, $projects);
-      if ($project != NULL) {
-        cablecast_upsert_post_meta($id, "cablecast_project_name", $project->name);
-        cablecast_upsert_post_meta($id, "cablecast_project_id", $project->id);
-        $processed_project = cablecast_replace_commas_in_tag($project->name);
-        wp_set_post_terms( $id, $processed_project, 'cablecast_project');
-      }
-    }
+    // if (empty($show->project) == FALSE) {
+    //   $project = cablecast_extract_id($show->project, $projects);
+    //   if ($project != NULL) {
+    //     cablecast_upsert_post_meta($id, "cablecast_project_name", $project->name);
+    //     cablecast_upsert_post_meta($id, "cablecast_project_id", $project->id);
+    //     $processed_project = cablecast_replace_commas_in_tag($project->name);
+    //     wp_set_post_terms( $id, $processed_project, 'cablecast_project');
+    //   }
+    // }
 
-    if (empty($show->category) == FALSE) {
-      $category = cablecast_extract_id($show->category, $categories);
-      if ($category != NULL) {
-        cablecast_upsert_post_meta($id, "cablecast_category_name", $category->name);
-        cablecast_upsert_post_meta($id, "cablecast_category_id", $category->id);
-        $term = get_cat_ID( $category->name);
-        wp_set_post_terms($id, $term, 'category', true);
-      }
-    }
-    cablecast_upsert_post_meta($id, "cablecast_show_id", $show->id);
-    cablecast_upsert_post_meta($id, "cablecast_show_title", $show->title);
-    cablecast_upsert_post_meta($id, "cablecast_show_cg_title", $show->cgTitle);
-    cablecast_upsert_post_meta($id, "cablecast_show_comments", $show->comments);
-    cablecast_upsert_post_meta($id, "cablecast_show_custom_1", $show->custom1);
-    cablecast_upsert_post_meta($id, "cablecast_show_custom_2", $show->custom2);
-    cablecast_upsert_post_meta($id, "cablecast_show_custom_3", $show->custom3);
-    cablecast_upsert_post_meta($id, "cablecast_show_custom_4", $show->custom4);
-    cablecast_upsert_post_meta($id, "cablecast_show_custom_5", $show->custom5);
-    cablecast_upsert_post_meta($id, "cablecast_show_custom_6", $show->custom6);
-    cablecast_upsert_post_meta($id, "cablecast_show_custom_7", $show->custom7);
-    cablecast_upsert_post_meta($id, "cablecast_show_custom_8", $show->custom8);
-    if (isset($show->customFields)) {
-      foreach ($show->customFields as $custom_field) {
-        // Look up name of field
-        $show_field = cablecast_extract_id($custom_field->showField, $show_fields);
-        $field_definition = cablecast_extract_id($show_field->fieldDefinition, $field_definitions);
-        cablecast_upsert_post_meta($id,  $field_definition->name, $custom_field->value);
-      }
-    }
+    // if (empty($show->category) == FALSE) {
+    //   $category = cablecast_extract_id($show->category, $categories);
+    //   if ($category != NULL) {
+    //     cablecast_upsert_post_meta($id, "cablecast_category_name", $category->name);
+    //     cablecast_upsert_post_meta($id, "cablecast_category_id", $category->id);
+    //     $term = get_cat_ID( $category->name);
+    //     wp_set_post_terms($id, $term, 'category', true);
+    //   }
+    // }
+    // cablecast_upsert_post_meta($id, "cablecast_show_id", $show->id);
+    // cablecast_upsert_post_meta($id, "cablecast_show_title", $show->title);
+    // cablecast_upsert_post_meta($id, "cablecast_show_cg_title", $show->cgTitle);
+    // cablecast_upsert_post_meta($id, "cablecast_show_comments", $show->comments);
+    // cablecast_upsert_post_meta($id, "cablecast_show_custom_1", $show->custom1);
+    // cablecast_upsert_post_meta($id, "cablecast_show_custom_2", $show->custom2);
+    // cablecast_upsert_post_meta($id, "cablecast_show_custom_3", $show->custom3);
+    // cablecast_upsert_post_meta($id, "cablecast_show_custom_4", $show->custom4);
+    // cablecast_upsert_post_meta($id, "cablecast_show_custom_5", $show->custom5);
+    // cablecast_upsert_post_meta($id, "cablecast_show_custom_6", $show->custom6);
+    // cablecast_upsert_post_meta($id, "cablecast_show_custom_7", $show->custom7);
+    // cablecast_upsert_post_meta($id, "cablecast_show_custom_8", $show->custom8);
+    // if (isset($show->customFields)) {
+    //   foreach ($show->customFields as $custom_field) {
+    //     // Look up name of field
+    //     $show_field = cablecast_extract_id($custom_field->showField, $show_fields);
+    //     $field_definition = cablecast_extract_id($show_field->fieldDefinition, $field_definitions);
+    //     cablecast_upsert_post_meta($id,  $field_definition->name, $custom_field->value);
+    //   }
+    // }
 
     cablecast_upsert_post_meta($id, "cablecast_show_event_date", $show->eventDate);
     cablecast_upsert_post_meta($id, "cablecast_show_location_id", $show->location);
@@ -360,15 +445,42 @@ function cablecast_sync_schedule($scheduleItems) {
   }
 }
 
+function cablecast_create_or_update_term($term_in, $taxonomy, $name, $slug) {
+  $term = term_exists($term_in, $taxonomy); // array is returned if taxonomy is given
+  if ($term == NULL) {
+    wp_insert_term(
+        $name,   // the term
+        $taxonomy, // the taxonomy,
+        [
+          'name' => $name,
+          'slug' => $slug,
+        ]
+    );
+  } else {
+    wp_update_term(
+      $term['term_id'],
+      $taxonomy,
+      [
+        'name' => $name,
+        'slug' => $slug,
+      ]
+    );
+  }
+}
+
+function cablecast_sync_tags($name_tags, $subject_tags) {
+  foreach($name_tags as $slug => $tag) {
+    cablecast_create_or_update_term($slug, 'product_tag', $tag["name"], $slug);
+  }
+
+  foreach($subject_tags as $slug => $tag) {
+    cablecast_create_or_update_term($slug, 'product_tag', $tag["name"], $slug);
+  }
+}
+
 function cablecast_sync_categories($categories) {
   foreach ($categories as $category) {
-    $term = term_exists( $category->name, 'category' ); // array is returned if taxonomy is given
-    if ($term == NULL) {
-      wp_insert_term(
-          $category->name,   // the term
-          'category' // the taxonomy
-      );
-    }
+    cablecast_create_or_update_term("$category->id", 'product_cat', $category->name, "$category->id");
   }
 }
 
@@ -462,8 +574,8 @@ function cablecast_insert_attachment_from_url($webFile, $post_id = null) {
 	$http = new WP_Http();
 	$response = $http->request( $url, array('timeout' => 20));
 
-	if (is_wp_error($response) || $response['response']['code'] != 200 ) { 
-	return;
+	if (is_wp_error($response) || $response['response']['code'] != 200 ) {
+	  return;
 	}
 
 	$upload = wp_upload_bits( basename($url), null, $response['body'] );
@@ -517,4 +629,10 @@ function cablecast_upsert_term_meta($id, $name, $value) {
 
 function cablecast_log ($message) {
   error_log("[Cablecast] $message");
+}
+
+function cablecast_get_human_readable_trt($trt) {
+  $dtF = new \DateTime('@0');
+  $dtT = new \DateTime("@$trt");
+  return $dtF->diff($dtT)->format('%H:%I:%S');
 }

@@ -30,6 +30,21 @@ function cablecast_settings_init()
             'cablecast_custom_data' => 'custom',
         ]
     );
+
+    // register a new field in the "cablecast_section_developers" section, inside the "cablecast" page
+    add_settings_field(
+        'cablecast_field_location', // as of WP 4.6 this value is used only internally
+        // use $args' label_for to populate the id inside the callback
+        __('Location', 'cablecast'),
+        'cablecast_field_location_cb',
+        'cablecast',
+        'cablecast_section_developers',
+        [
+            'label_for'         => 'cablecast_field_location',
+            'class'             => 'cablecast_row',
+            'cablecast_custom_data' => 'custom',
+        ]
+    );
 }
 
 /**
@@ -66,6 +81,17 @@ function cablecast_field_server_cb($args)
     // output the field
     ?>
     <input type="url" name="cablecast_options[server]" class="regular-text code" value="<?= isset($options['server']) ? esc_attr($options['server']) : ''; ?>">
+
+    <?php
+}
+
+function cablecast_field_location_cb($args)
+{
+    // get the value of the setting we've registered with register_setting()
+    $options = get_option('cablecast_options');
+    // output the field
+    ?>
+    <input type="number" name="cablecast_options[location]" class="regular-text code" value="<?= isset($options['location']) ? esc_attr($options['location']) : ''; ?>">
 
     <?php
 }
